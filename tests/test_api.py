@@ -135,3 +135,157 @@ def test_stats_endpoint(client):
     assert body["active_waybills"] == 1
     assert body["active_total_weight_kg"] == 10
     assert set(body["packages"]) == {"applied", "suspended", "rejected"}
+
+
+# --------------------------------------------------------------------------- #
+# 修复后的回归：跨旧单同货批合计
+# --------------------------------------------------------------------------- #
+def test_http_cross_waybill_batch_total_not_rejected(client):
+    """旧单同货批合计 100kg，新单足量时必须生效并进入对账 CSV。"""
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    r = _post_package(client, "P1", ["W1", "W2"], {"N1": {"B1": 100}})
+    assert r.status_code == 201
+    assert r.json()["package"]["status"] == "applied", r.json()
+
+    text = client.get("/api/reconciliation.csv").content.decode("utf-8-sig")
+    assert "N1,B1,100" in text
+    assert "W1" not in text and "W2" not in text
+    assert client.get("/api/stats").json()["active_total_weight_kg"] == 100
+
+
+def test_http_underweight_new_package_rejected(client):
+    """少报重量的新单仍必须拒收，不能进入 CSV。"""
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    r = _post_package(client, "P1", ["W1", "W2"], {"N1": {"B1": 99}})
+    assert r.status_code == 201
+    body = r.json()["package"]
+    assert body["status"] == "rejected"
+    assert "旧合计=100kg" in body["reason"] and "新合计=99kg" in body["reason"]
+    text = client.get("/api/reconciliation.csv").content.decode("utf-8-sig")
+    assert "N1" not in text
+
+
+def _seed_legacy_rejection(client, payload):
+    """直接写入一条旧版逻辑造成的“重量不一致”拒收记录。"""
+    import json
+
+    from app import database
+    from app.schemas import PackageIn
+    from app.services import canonical_payload, content_hash
+
+    pkg = PackageIn.model_validate(payload)
+    digest = content_hash(pkg)
+    with database.write_transaction() as conn:
+        conn.execute(
+            "INSERT INTO packages (package_no, payload, content_hash, status, "
+            "reason, logic_version, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'rejected', ?, 1, ?, ?)",
+            (
+                pkg.package_no,
+                json.dumps(canonical_payload(pkg), ensure_ascii=False, sort_keys=True),
+                digest,
+                "逐货批重量不一致 -> B1: 旧=50kg/新=100kg",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+
+
+def test_http_legacy_false_rejection_replayed_and_applied(client):
+    """旧版误拒包收到原包号原内容重传：200 replayed，并按当前台账切换。"""
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    payload = {
+        "package_no": "P1",
+        "old_waybill_nos": ["W1", "W2"],
+        "new_waybills": [{"waybill_no": "N1", "batches": [
+            {"batch_no": "B1", "weight_kg": 100}]}],
+    }
+    _seed_legacy_rejection(client, payload)
+    r = client.post("/api/packages", json=payload)
+    assert r.status_code == 200
+    assert r.json()["replayed"] is True
+    p = r.json()["package"]
+    assert p["status"] == "applied" and p["reason"] is None
+    assert "N1,B1,100" in client.get("/api/reconciliation.csv").content.decode(
+        "utf-8-sig"
+    )
+
+
+def test_http_legacy_replay_still_conflicting_reports_current_reason(client):
+    """复核时冲突仍在：整包拒收，返回当前原因，不进入 CSV。"""
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    payload = {
+        "package_no": "P1",
+        "old_waybill_nos": ["W1", "W2"],
+        "new_waybills": [{"waybill_no": "N1", "batches": [
+            {"batch_no": "B1", "weight_kg": 90}]}],
+    }
+    _seed_legacy_rejection(client, payload)
+    r = client.post("/api/packages", json=payload)
+    assert r.status_code == 200
+    p = r.json()["package"]
+    assert p["status"] == "rejected"
+    assert "旧合计=100kg" in p["reason"] and "新合计=90kg" in p["reason"]
+    assert "N1" not in client.get("/api/reconciliation.csv").content.decode(
+        "utf-8-sig"
+    )
+
+
+def test_http_replay_same_no_different_content_still_409(client):
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    assert _post_package(client, "P1", ["W1", "W2"],
+                         {"N1": {"B1": 100}}).status_code == 201
+    # 同号异内容（即便同样足量）必须 409
+    r = _post_package(client, "P1", ["W1", "W2"], {"N2": {"B1": 100}})
+    assert r.status_code == 409
+    assert "内容不同" in r.json()["detail"]
+    # 原结果保留
+    p = {x["package_no"]: x for x in client.get("/api/packages").json()}["P1"]
+    assert p["status"] == "applied"
+
+
+def test_openapi_schema_available(client):
+    r = client.get("/openapi.json")
+    assert r.status_code == 200
+    assert "/api/packages" in r.json()["paths"]
+
+
+def test_package_view_exposes_logic_version(client):
+    _post_waybill(client, "W1", {"B1": 10})
+    r = _post_package(client, "P1", ["W1"], {"N1": {"B1": 10}})
+    assert r.json()["package"]["logic_version"] == 2
+    listed = client.get("/api/packages").json()
+    assert listed[0]["logic_version"] == 2
+
+
+def test_write_conflict_maps_to_409(client, monkeypatch):
+    """写锁等待超时（多进程部署场景）返回 409 且提示可重试。"""
+    from app import services
+    from app.database import WriteConflict
+
+    def boom(*args, **kwargs):
+        raise WriteConflict("database is locked")
+
+    monkeypatch.setattr(services, "write_transaction", boom)
+    r = _post_waybill(client, "W1", {"B1": 10})
+    assert r.status_code == 409
+    assert "重试" in r.json()["detail"]
+
+
+def test_http_underweight_matching_one_old_waybill_not_in_csv(client):
+    """旧版会放行的“等于单张旧单重量”的少报新单，现在必须拒收且不进 CSV。"""
+    _post_waybill(client, "W1", {"B1": 50})
+    _post_waybill(client, "W2", {"B1": 50})
+    r = _post_package(client, "P1", ["W1", "W2"], {"N1": {"B1": 50}})
+    body = r.json()["package"]
+    assert body["status"] == "rejected"
+    assert "旧合计=100kg" in body["reason"]
+    text = client.get("/api/reconciliation.csv").content.decode("utf-8-sig")
+    assert "N1" not in text
+    assert "W1,B1,50" in text and "W2,B1,50" in text
+    assert client.get("/api/stats").json()["active_total_weight_kg"] == 100

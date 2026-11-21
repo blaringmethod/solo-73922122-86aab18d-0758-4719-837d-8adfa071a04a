@@ -87,11 +87,11 @@
     <input id="pkg-no" placeholder="例如 P1" />
     <label>旧单号（每行一个）</label>
     <textarea id="pkg-old" placeholder="W001&#10;W002"></textarea>
-    <label>新单（逐货批重量合计须与旧单完全一致）</label>
+    <label>新单（逐货批合计重量须与旧单合计完全一致）</label>
     <div id="pkg-news"></div>
     <button class="mini gray" onclick="addNewWaybill()">+ 新单</button>
     <div style="margin-top:14px"><button class="primary" onclick="submitPackage()">整包提交</button></div>
-    <p class="muted" style="margin-top:10px">同包号同内容重传沿用原结果；异内容拒收。校验未通过会在下方“改单包”列表给出原因。</p>
+    <p class="muted" style="margin-top:10px">多张旧单记同一货批时按合计校验；新单之间货批号不可重复。同包号同内容重传沿用原结果（旧版误拒的重量包会按现行台账复核）；异内容拒收。校验未通过会在下方“改单包”列表给出原因。</p>
   </section>
 
   <!-- 运单列表 -->
@@ -216,8 +216,9 @@ async function submitPackage() {
   const data = await r.json();
   if (!r.ok) return toast(formatErr(data), false);
   const p = data.package;
-  toast(`包 ${p.package_no}：${statusText(p.status)}${data.replayed ? "（重传沿用原结果）" : ""}`,
-        p.status !== "rejected");
+  const extra = data.replayed ? "（同号同内容重传，结果见下方列表）" : "";
+  toast(`包 ${p.package_no}：${statusText(p.status)}${extra}` +
+        (p.reason ? `\n${p.reason}` : ""), p.status !== "rejected");
   $("pkg-no").value = ""; $("pkg-old").value = ""; $("pkg-news").innerHTML = "";
   addNewWaybill();
   refreshAll();
@@ -274,10 +275,37 @@ function renderPackages() {
           ).join("<br>")}</td>
       <td>${p.reason ? `<span class="reason">${esc(p.reason)}</span>`
             : '<span class="muted">整包切换成功</span>'}</td>
-      <td><code title="${esc(p.content_hash)}">${esc(p.content_hash.slice(0, 10))}…</code></td>
+      <td><code title="${esc(p.content_hash)}">${esc(p.content_hash.slice(0, 10))}…</code>
+        <br><button type="button" class="mini gray replay-btn"
+            data-package-no="${esc(p.package_no)}">原包号原内容重传</button></td>
     </tr>`).join("");
   $("pkg-tbody").innerHTML = rows ||
     '<tr><td colspan="6" class="muted">暂无改单包</td></tr>';
+}
+// 事件委托：避免把数据拼进内联 onclick
+$("pkg-tbody").addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".replay-btn");
+  if (btn) replayPackage(btn.dataset.packageNo);
+});
+async function replayPackage(packageNo) {
+  const p = packages.find(x => x.package_no === packageNo);
+  if (!p) return;
+  // 原包号 + 原内容重传：同内容沿用结果；旧版误拒的重量包会按现行台账复核
+  const payload = {
+    package_no: p.package_no,
+    old_waybill_nos: p.old_waybill_nos,
+    new_waybills: p.new_waybills,
+  };
+  const r = await fetch("/api/packages", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const data = await r.json();
+  if (!r.ok) return toast(formatErr(data), false);
+  const np = data.package;
+  toast(`包 ${np.package_no} 重传：${statusText(np.status)}` +
+        (np.reason ? `\n${np.reason}` : ""), np.status !== "rejected");
+  refreshAll();
 }
 function downloadCsv() { window.location = "/api/reconciliation.csv"; }
 

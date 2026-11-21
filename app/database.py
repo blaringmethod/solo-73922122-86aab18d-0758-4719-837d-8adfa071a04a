@@ -18,6 +18,10 @@ DEFAULT_DB_PATH = os.environ.get(
 # 进程内写锁：FastAPI 同步端点跑在线程池中，需要它把写事务完全串行化。
 _write_lock = threading.RLock()
 
+
+class WriteConflict(Exception):
+    """写事务在等待期内未能取得写锁（其他进程占用）。"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS waybills (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -44,6 +48,8 @@ CREATE TABLE IF NOT EXISTS packages (
     content_hash TEXT NOT NULL,
     status      TEXT NOT NULL CHECK (status IN ('applied', 'suspended', 'rejected')),
     reason      TEXT,
+    -- 处理该包时的校验逻辑版本；1 = 旧版（按单张旧单覆盖，未做跨单合计）
+    logic_version INTEGER NOT NULL DEFAULT 1,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -60,16 +66,37 @@ def _connect(db_path: str | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA busy_timeout = 30000")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.OperationalError:
+        # WAL 是持久化设置；并发连接短暂占锁时沿用库中既有模式即可。
+        pass
     return conn
 
 
 def init_db(db_path: str | None = None) -> None:
-    """建表（幂等）。"""
+    """建表并做幂等迁移（旧库缺少 logic_version 列时补上）。"""
     conn = _connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        columns = {
+            r["name"] for r in conn.execute("PRAGMA table_info(packages)")
+        }
+        if "logic_version" not in columns:
+            try:
+                conn.execute(
+                    "ALTER TABLE packages ADD COLUMN logic_version INTEGER "
+                    "NOT NULL DEFAULT 1"
+                )
+            except sqlite3.OperationalError:
+                # 另一个进程可能刚完成同一迁移；确认列已存在即可。
+                columns = {
+                    r["name"]
+                    for r in conn.execute("PRAGMA table_info(packages)")
+                }
+                if "logic_version" not in columns:
+                    raise
         conn.commit()
     finally:
         conn.close()
@@ -90,7 +117,10 @@ def write_transaction(db_path: str | None = None) -> Iterator[sqlite3.Connection
     with _write_lock:
         conn = _connect(db_path)
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                raise WriteConflict(f"写入繁忙，请重试: {exc}") from exc
             yield conn
             conn.commit()
         except Exception:

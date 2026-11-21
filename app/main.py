@@ -10,7 +10,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from . import services
-from .database import init_db
+from .database import WriteConflict, init_db
 from .schemas import PackageIn, WaybillIn
 from .services import DomainError
 
@@ -24,7 +24,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="联运改单对账演示",
     description="原单录入、改单包整包切换（拆单/并单）、挂起续办与对账 CSV",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -33,6 +33,14 @@ app = FastAPI(
 async def domain_error_handler(_, exc: DomainError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code, content={"detail": exc.message}
+    )
+
+
+@app.exception_handler(WriteConflict)
+async def write_conflict_handler(_, exc: WriteConflict) -> JSONResponse:
+    # 多进程部署时仍可能出现写锁竞争；事务已整体回滚，可安全重试。
+    return JSONResponse(
+        status_code=409, content={"detail": f"写入冲突，请重试: {exc}"}
     )
 
 

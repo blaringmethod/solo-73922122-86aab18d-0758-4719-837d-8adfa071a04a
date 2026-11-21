@@ -1,11 +1,13 @@
 """业务规则与持久化。
 
 核心规则：
-* 改单包以一组新单替换一组旧单，逐货批重量相等且新单号从未生效才可整包切换；
-* 旧单未到齐 -> 挂起（suspended），原单补齐后自动续办；
+* 改单包以一组新单替换一组旧单，逐货批“跨单合计重量”相等且新单号
+  从未生效才可整包切换（同一货批出现在多张旧/新单时重量相加，不做覆盖）；
+* 旧单未到齐 -> 挂起（suspended），原单补齐后自动续办（同样按合计校验）；
 * 任一旧单已被替换 -> 整包拒收（rejected）；
 * 新单号曾经生效（含已被替换的历史单）-> 拒收；
-* 同包号同内容重传沿用原处理结果，异内容 -> 拒收（409）；
+* 同包号同内容重传沿用原处理结果；异内容 -> 拒收（409）；
+  旧版因旧单重量少算而误拒的包，同号同内容重传时按现行台账复核；
 * 写事务串行化，并行提交时同一旧单最多被替换一次。
 """
 from __future__ import annotations
@@ -19,6 +21,11 @@ from typing import Any
 
 from .database import read_connection, write_transaction
 from .schemas import PackageIn, WaybillIn
+
+
+# 校验逻辑版本：1 为旧版（旧单同货批仅保留一张，未做跨单合计），2 为合计版。
+# 旧库迁移后历史包默认记为 1；修复上线后新写入的包记为 2。
+LOGIC_VERSION = 2
 
 
 class DomainError(Exception):
@@ -119,6 +126,7 @@ def _package_view(row: sqlite3.Row) -> dict[str, Any]:
         "old_waybill_nos": payload["old_waybill_nos"],
         "new_waybills": payload["new_waybills"],
         "content_hash": row["content_hash"],
+        "logic_version": row["logic_version"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -173,16 +181,60 @@ class Evaluation:
     reason: str | None
 
 
-def _evaluate(conn: sqlite3.Connection, package: PackageIn) -> Evaluation:
-    """按既定优先级校验一个改单包。"""
-    old_rows = {
-        r["waybill_no"]: r
+def _old_batch_totals(
+    conn: sqlite3.Connection, old_waybill_nos: list[str]
+) -> dict[str, int]:
+    """旧单合计：同一货批号跨多张旧单时重量相加（而不是后写覆盖先写）。
+
+    这正是本修复的核心：几张旧单记了同一货批时，校验必须比较“合计重量”，
+    否则旧单中同货批只保留一张的重量，会把足量的新单误判为超重而拒收。
+    """
+    totals: dict[str, int] = {}
+    for no in old_waybill_nos:
         for r in conn.execute(
-            "SELECT * FROM waybills WHERE waybill_no IN (%s)"
-            % ",".join("?" * len(package.old_waybill_nos)),
-            package.old_waybill_nos,
-        )
-    }
+            "SELECT batch_no, weight_kg FROM batches b "
+            "JOIN waybills w ON w.id = b.waybill_id WHERE w.waybill_no = ?",
+            (no,),
+        ):
+            totals[r["batch_no"]] = totals.get(r["batch_no"], 0) + r["weight_kg"]
+    return totals
+
+
+def _new_batch_totals(package: PackageIn) -> dict[str, int]:
+    """新单重量映射：新单之间货批号唯一（schema 已保证），这里仍用累加写法。"""
+    totals: dict[str, int] = {}
+    for w in package.new_waybills:
+        for b in w.batches:
+            totals[b.batch_no] = totals.get(b.batch_no, 0) + b.weight_kg
+    return totals
+
+
+def _weight_mismatch_details(
+    old_totals: dict[str, int], new_totals: dict[str, int]
+) -> list[str]:
+    """差异明细使用“旧合计/新合计”，便于数据员核对跨单合计。"""
+    details: list[str] = []
+    for key in sorted(set(old_totals) | set(new_totals)):
+        o, n = old_totals.get(key), new_totals.get(key)
+        if o != n:
+            o_txt = f"{o}kg" if o is not None else "缺该货批"
+            n_txt = f"{n}kg" if n is not None else "缺该货批"
+            details.append(f"{key}: 旧合计={o_txt}/新合计={n_txt}")
+    return details
+
+
+def _evaluate(conn: sqlite3.Connection, package: PackageIn) -> Evaluation:
+    """按既定优先级校验一个改单包（直接提交与续办共用此处）。"""
+    old_rows: dict[str, sqlite3.Row] = {}
+    if package.old_waybill_nos:
+        placeholders = ",".join("?" * len(package.old_waybill_nos))
+        old_rows = {
+            r["waybill_no"]: r
+            for r in conn.execute(
+                f"SELECT * FROM waybills WHERE waybill_no IN ({placeholders})",
+                package.old_waybill_nos,
+            )
+        }
     # 1) 任一旧单已被替换 -> 整包拒收
     replaced = [no for no, r in old_rows.items() if r["status"] == "replaced"]
     if replaced:
@@ -213,27 +265,14 @@ def _evaluate(conn: sqlite3.Connection, package: PackageIn) -> Evaluation:
                 "rejected",
                 f"新单号曾生效或已存在，不可复用: {', '.join(sorted(clash))}",
             )
-    # 4) 逐货批重量相等（旧单集合与新单集合的 货批号->重量 映射必须完全一致）
-    old_weights: dict[str, int] = {}
-    for no in package.old_waybill_nos:
-        for r in conn.execute(
-            "SELECT batch_no, weight_kg FROM batches b "
-            "JOIN waybills w ON w.id = b.waybill_id WHERE w.waybill_no = ?",
-            (no,),
-        ):
-            old_weights[r["batch_no"]] = r["weight_kg"]
-    new_weights: dict[str, int] = {}
-    for w in package.new_waybills:
-        for b in w.batches:
-            new_weights[b.batch_no] = b.weight_kg
-    if old_weights != new_weights:
-        details: list[str] = []
-        for key in sorted(set(old_weights) | set(new_weights)):
-            o, n = old_weights.get(key), new_weights.get(key)
-            if o != n:
-                details.append(f"{key}: 旧={o}kg/新={n}kg")
+    # 4) 逐货批合计重量相等（旧单集合与新建单集合的 货批号->合计重量 必须一致）
+    old_totals = _old_batch_totals(conn, package.old_waybill_nos)
+    new_totals = _new_batch_totals(package)
+    if old_totals != new_totals:
         return Evaluation(
-            "rejected", "逐货批重量不一致 -> " + "; ".join(details)
+            "rejected",
+            "逐货批合计重量不一致 -> "
+            + "; ".join(_weight_mismatch_details(old_totals, new_totals)),
         )
     return Evaluation("applied", None)
 
@@ -264,6 +303,7 @@ def _resume_suspended(conn: sqlite3.Connection) -> list[str]:
     """续办所有挂起包：按提交顺序逐轮重判，直到一轮中没有包被切换为止。
 
     拒收为终态；仍缺单的包保持挂起；一个包切换后可能解锁后续包，因此循环重判。
+    每次重判都调用 :func:`_evaluate`，因此同样按货批跨单合计重量比较。
     """
     applied: list[str] = []
     while True:
@@ -279,20 +319,51 @@ def _resume_suspended(conn: sqlite3.Connection) -> list[str]:
                 _apply_package(conn, package)
                 conn.execute(
                     "UPDATE packages SET status = 'applied', reason = NULL, "
-                    "updated_at = ? WHERE id = ?",
-                    (_now(), row["id"]),
+                    "logic_version = ?, updated_at = ? WHERE id = ?",
+                    (LOGIC_VERSION, _now(), row["id"]),
                 )
                 applied.append(package.package_no)
                 progress = True
             elif result.status == "rejected":
                 conn.execute(
                     "UPDATE packages SET status = 'rejected', reason = ?, "
-                    "updated_at = ? WHERE id = ?",
-                    (result.reason, _now(), row["id"]),
+                    "logic_version = ?, updated_at = ? WHERE id = ?",
+                    (result.reason, LOGIC_VERSION, _now(), row["id"]),
                 )
         if not progress:
             break
     return applied
+
+
+def _recheck_replayed_package(
+    conn: sqlite3.Connection, package: PackageIn, existing: sqlite3.Row
+) -> sqlite3.Row:
+    """同号同内容重传一条旧版“重量不一致”拒收包时，按现行台账复核。
+
+    旧版把旧单的 货批号->重量 存成字典，同一货批在多张旧单中出现时后写覆盖
+    先写，导致旧单重量被少算，足量的新单被误拒。这类包在同号同内容重传时
+    必须重新校验；只有旧单仍全部有效、新单号从未生效且合计重量一致，才整包
+    切换。复核时出现任何冲突（旧单失效、新单号已占用、合计不符）都保持整包
+    拒收，并把原因更新为当前原因；绝不部分替换。
+    """
+    result = _evaluate(conn, package)
+    if result.status == "suspended":
+        # 复核场景不存在“等待后续单据”：缺单也属于当前冲突，整包拒收。
+        result = Evaluation("rejected", f"复核时旧单未全部有效: {result.reason}")
+    now = _now()
+    if result.status == "applied":
+        _apply_package(conn, package)
+    conn.execute(
+        "UPDATE packages SET status = ?, reason = ?, logic_version = ?, "
+        "updated_at = ? WHERE id = ?",
+        (result.status, result.reason, LOGIC_VERSION, now, existing["id"]),
+    )
+    if result.status == "applied":
+        # 复核生效可能改变旧单状态，让其他挂起包按最新台账重新判定。
+        _resume_suspended(conn)
+    return conn.execute(
+        "SELECT * FROM packages WHERE id = ?", (existing["id"],)
+    ).fetchone()
 
 
 def submit_package(package: PackageIn) -> tuple[dict[str, Any], bool]:
@@ -311,21 +382,32 @@ def submit_package(package: PackageIn) -> tuple[dict[str, Any], bool]:
                 raise DomainError(
                     f"包号 {package.package_no} 已存在且内容不同，整包拒收"
                 )
-            # 同包号同内容：沿用原处理结果，不改变任何状态
             replayed = True
+            # 旧版因旧单重量少算而误拒的包：同号同内容重传时按现行台账复核。
+            if (
+                existing["status"] == "rejected"
+                and existing["logic_version"] < LOGIC_VERSION
+                and "重量不一致" in (existing["reason"] or "")
+            ):
+                return _package_view(
+                    _recheck_replayed_package(conn, package, existing)
+                ), replayed
+            # 其他同内容重传：沿用原处理结果，不改变任何状态
             return _package_view(existing), replayed
 
         now = _now()
         result = _evaluate(conn, package)
         cur = conn.execute(
             "INSERT INTO packages (package_no, payload, content_hash, status, "
-            "reason, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "reason, logic_version, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 package.package_no,
                 payload,
                 digest,
                 result.status,
                 result.reason,
+                LOGIC_VERSION,
                 now,
                 now,
             ),

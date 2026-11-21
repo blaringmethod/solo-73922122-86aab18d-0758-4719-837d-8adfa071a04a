@@ -94,7 +94,8 @@ class PackageIn(BaseModel):
         overlap = set(new_nos) & set(self.old_waybill_nos)
         if overlap:
             raise ValueError(f"新单号不得与旧单号相同: {sorted(overlap)}")
-        # 新单之间的货批号也不允许重复（同一批货在新单集合中必须唯一归属）
+        # 新单之间的货批号不允许重复（同一批货在新单集合中必须唯一归属）；
+        # 重量校验仍按“货批号跨旧单合计”比较，见 services._evaluate。
         seen: set[str] = set()
         for w in self.new_waybills:
             for b in w.batches:
@@ -127,5 +128,6 @@ class PackageView(BaseModel):
     old_waybill_nos: list[str]
     new_waybills: list[NewWaybillIn]
     content_hash: str
+    logic_version: int
     created_at: str
     updated_at: str
